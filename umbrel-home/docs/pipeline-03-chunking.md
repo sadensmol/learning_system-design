@@ -5,6 +5,12 @@
 > For the algorithms, worked examples, per-data-type behavior, streaming,
 > resumability, and performance numbers on ARM, see the standalone
 > [`../../cdc-guide.md`](../../cdc-guide.md).
+>
+> The upstream component that feeds bytes into the chunker — file
+> enumeration, change detection, stable-read — is
+> [`pipeline-02-file-capture.md`](pipeline-02-file-capture.md). The walker decides
+> *whether* to re-chunk a file; this doc covers *how* the chunks are
+> formed and deduplicated.
 
 ## What this gives us
 

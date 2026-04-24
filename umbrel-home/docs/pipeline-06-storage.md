@@ -1,6 +1,13 @@
 # Versioning & Retention
 
 > Referenced from [`plans/2026-04-23.md`](plans/2026-04-23.md) D-4 / D-8.
+>
+> Assumes familiarity with Merkle trees — if that term is new, read
+> [`../../merkle-trees-guide.md`](../../merkle-trees-guide.md) first.
+> One-paragraph summary: a Merkle tree hashes pairs of hashes
+> recursively up to a single ~32-byte root that commits to every
+> leaf; any change anywhere re-hashes the root; unchanged subtrees
+> produce the same subtree hash (so they dedup).
 
 ## Mental model
 
@@ -58,6 +65,186 @@ Key properties:
   addressing.
 - The manifest is encrypted; the server stores it as a blob like any other
   chunk.
+
+## Metadata DB schema
+
+The server-side metadata DB is a managed relational DB (Postgres-class).
+It sees only **ciphertext and references** — no plaintext user data,
+no file names, no DB schemas. Its tables:
+
+```sql
+-- Accounts & devices (control plane)
+CREATE TABLE users (
+  user_id          UUID PRIMARY KEY,
+  created_at       TIMESTAMPTZ NOT NULL,
+  retention_policy JSONB NOT NULL,        -- grandfather-father-son rules
+  quota_bytes      BIGINT NOT NULL
+);
+
+CREATE TABLE devices (
+  device_id     UUID PRIMARY KEY,
+  user_id       UUID NOT NULL REFERENCES users,
+  device_pubkey BYTEA NOT NULL,           -- X25519
+  wrapped_kek   BYTEA NOT NULL,           -- KEK wrapped to this device's pubkey
+  paired_at     TIMESTAMPTZ NOT NULL,
+  last_seen_at  TIMESTAMPTZ,
+  revoked_at    TIMESTAMPTZ
+);
+
+-- Chunk existence (dedup index + GC tracking)
+CREATE TABLE chunks (
+  user_id    UUID NOT NULL,
+  ct_hash    BYTEA NOT NULL,              -- ciphertext content address
+  size       INTEGER NOT NULL,
+  tier       TEXT NOT NULL,               -- 'standard' | 'ia' | 'cold'
+  created_at TIMESTAMPTZ NOT NULL,
+  gc_state   TEXT NOT NULL DEFAULT 'live', -- 'live' | 'candidate' | 'deleted'
+  PRIMARY KEY (user_id, ct_hash)
+);
+-- `HEAD /chunks/{ct-hash}` is a single PK lookup on (user_id, ct_hash).
+
+-- Snapshots (one row per successful POST /snapshots)
+CREATE TABLE snapshots (
+  snapshot_id       BYTEA PRIMARY KEY,    -- Merkle root hash, client-computed
+  user_id           UUID NOT NULL REFERENCES users,
+  device_id         UUID NOT NULL REFERENCES devices,
+  parent_snapshot_id BYTEA,               -- prior snapshot for this resource group
+  resource_group    TEXT NOT NULL,        -- opaque app identifier
+  manifest_ct_hash  BYTEA NOT NULL,       -- points to encrypted manifest chunk
+  fence_watermark   BIGINT NOT NULL,      -- see databases.md §fence
+  committed_at      TIMESTAMPTZ NOT NULL,
+  pinned            BOOLEAN NOT NULL DEFAULT TRUE  -- set by retention
+);
+
+-- Snapshot → chunks edges (one row per referenced chunk, used by GC)
+CREATE TABLE chunk_refs (
+  user_id     UUID NOT NULL,
+  snapshot_id BYTEA NOT NULL REFERENCES snapshots,
+  ct_hash     BYTEA NOT NULL,
+  PRIMARY KEY (user_id, snapshot_id, ct_hash)
+);
+```
+
+Three things worth calling out:
+
+- **Manifests live in object storage, not the DB.** An encrypted
+  manifest is just another content-addressed ciphertext chunk. The
+  metadata DB only stores its `ct_hash` pointer via
+  `snapshots.manifest_ct_hash`. This keeps the DB small — hot rows
+  only — and lets manifests ride the exact same lifecycle as file
+  chunks (same tiering, same GC, same dedup for unchanged subtrees).
+- **`chunks.user_id` is part of the primary key** — per-user dedup
+  only; the same ciphertext for two users is stored twice. This is
+  the zero-knowledge-enforced price (see
+  [`pipeline-04-encryption.md`](pipeline-04-encryption.md) §Per-user
+  dedup).
+- **Append-only for data rows.** `snapshots` and `chunk_refs` rows
+  are written once and never updated (except `chunks.gc_state` and
+  `snapshots.pinned`, which are GC / retention mutations). Server
+  can never rewrite a historical snapshot — the Merkle root hash
+  would change, which the client can detect.
+
+## From walker events to stored rows
+
+A walker event ([`pipeline-02-file-capture.md`](pipeline-02-file-capture.md#event-delivery))
+is not itself a row in any database. It's an in-memory hand-off.
+Events become **durable** at the snapshot commit boundary, at which
+point they land as a combination of new rows in the metadata DB and
+new entries inside the encrypted manifest blob.
+
+### What the encrypted manifest holds (client view)
+
+The manifest is a client-built, client-encrypted data structure. The
+server never sees its plaintext. Its internal shape per resource
+group:
+
+```text
+Manifest {
+  resource_group_id  -- opaque app identifier (still hashed, not name)
+  parent_manifest    -- ct_hash of the prior snapshot's manifest
+  fence_watermark    -- cross-system consistency marker
+  entries: [
+    FileEntry  { path, size, mtime, mode, chunk_roots: [ct_hash, ...] }
+    FileEntry  { ... }
+    Tombstone  { path, deleted_at }
+    DBEntry    { kind='mongo'|'sqlite', base_chunks, changelog_chunks, fence }
+    ...
+  ]
+}
+```
+
+The entry list is a Merkle tree internally (subtree hashes per
+directory), so unchanged directories share sub-manifests with the
+previous snapshot — the same dedup property files enjoy, applied to
+the manifest itself. Large libraries where only a few photos changed
+produce a tiny manifest delta.
+
+### Event → storage translation
+
+Each walker event type maps to specific writes at commit time. Assume
+the commit coalesces N events into one snapshot.
+
+| Walker event | New rows in metadata DB | Entry in encrypted manifest |
+|---|---|---|
+| `NEW` (path P, K new chunks) | 0–K rows in `chunks` (only for ct-hashes this user didn't already have) | `FileEntry { path=P, size, mtime, mode, chunk_roots=[...] }` |
+| `CHANGED` (path P, K' new chunks after CDC) | 0–K' rows in `chunks` (typically far fewer than total file chunks — CDC dedup) | `FileEntry` replaces the previous `FileEntry` for P in the new manifest |
+| `DELETED` (path P) | 0 new `chunks` rows | `Tombstone { path=P, deleted_at }` instead of a `FileEntry` |
+
+Then, once per commit, regardless of how many events it coalesces:
+
+- **1 row in `snapshots`** — the new snapshot root hash, parent ref,
+  fence, manifest `ct_hash`.
+- **M rows in `chunk_refs`** — one per distinct `ct_hash` the new
+  snapshot's manifest transitively references (files + DBs +
+  sub-manifests). Most are shared with the parent snapshot via dedup.
+- **1 new chunk row** for the encrypted manifest itself (if its
+  content differs from the parent's — which it always does if at
+  least one event is in the commit).
+
+### Worked example: one photo added, one renamed, one deleted
+
+User adds `A.jpg`, renames `B.jpg` → `B2.jpg`, deletes `C.jpg`. All
+during a 5-minute batching window. On commit:
+
+1. Walker has emitted four events: `NEW A.jpg`, `DELETED B.jpg`,
+   `NEW B2.jpg`, `DELETED C.jpg`.
+2. Chunker produced chunks for A and B2. Because B2 has the same
+   bytes as B, its CDC chunks hash identically to B's — the server
+   already has those ct-hashes. Only A's chunks are new.
+3. At commit:
+   - `chunks` gets K new rows (one per A's unique ct-hash).
+   - The encrypted manifest is rebuilt: the `FileEntry` for `A.jpg`
+     is added; `FileEntry` for `B.jpg` is removed; `FileEntry` for
+     `B2.jpg` is added (reusing B's ct-hashes); `Tombstone` for
+     `C.jpg` is recorded.
+   - The new manifest ciphertext is uploaded as a chunk; `chunks`
+     gets one row for the new manifest ct-hash.
+   - `snapshots` gets one new row.
+   - `chunk_refs` gets rows for every ct-hash reachable from the new
+     manifest — mostly shared with the previous snapshot's
+     `chunk_refs`, plus the K new ones for A and the one for the new
+     manifest.
+
+Wire cost: ~K chunks (A's content) plus one small manifest delta.
+Rename costs zero new content thanks to ct-hash matching. Delete
+costs zero content, just a tombstone.
+
+### Immutability and auditability
+
+Once `snapshots.snapshot_id` is written, nothing about that snapshot
+ever changes in a way that affects its identity. `snapshot_id` is
+the Merkle root of the manifest; any mutation would re-hash. The
+server cannot rewrite history without the client detecting it on
+the next parent-chain walk.
+
+Mutable fields on existing rows are limited to:
+
+- `chunks.gc_state` / `chunks.tier` — GC and lifecycle transitions.
+- `snapshots.pinned` — retention evaluator flips this; the content
+  the snapshot refers to is unaffected.
+- `devices.revoked_at` — device revocation.
+
+Nothing the user authored is ever rewritten by the server.
 
 ## Snapshot cadence
 
@@ -149,7 +336,7 @@ photo."
 - **Undelete a file deleted yesterday** = look at the previous snapshot,
   copy its entry for that file back into the current state.
 - **Roll back DB to time T** = restore DB base + replay encrypted oplog up to
-  T. See [`mongodb-backup.md`](mongodb-backup.md).
+  T. See [`databases.md`](databases.md).
 
 No per-feature code paths: each is a read against the snapshot tree.
 

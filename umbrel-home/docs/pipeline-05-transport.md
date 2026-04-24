@@ -71,6 +71,11 @@ The effect: the device never commits unbounded memory to backup work, no
 matter how much new content appears. Upload latency grows gracefully under
 backlog instead of the agent crashing.
 
+How the agent decides there is something to upload — filesystem watcher,
+DB tailers, cursors, and overlap prevention for periodic base jobs — is a
+separate concern from the wire protocol and lives in its own doc:
+[`pipeline-01-detection.md`](pipeline-01-detection.md).
+
 ## Device policy
 
 The agent reads a policy block (user-configurable) that gates when uploads

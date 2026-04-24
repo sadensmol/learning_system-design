@@ -80,7 +80,7 @@ flowchart LR
 - The server stores one wrapped-KEK record per device.
 - Enrolling a new device = an existing device decrypts KEK, re-wraps for the
   new device's pubkey, uploads the new wrapped record (see
-  [`multi-device-access.md`](multi-device-access.md)).
+  [`multi-device.md`](multi-device.md)).
 - Revoking a device = delete that device's wrapped-KEK record and rotate the
   KEK. Old blobs stay encrypted under the old KEK; new blobs use the new one.
   Forward secrecy after rotation.

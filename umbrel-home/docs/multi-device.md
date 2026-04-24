@@ -138,7 +138,7 @@ overall threat model; the residual metadata is what it is.
   out-of-scope; reading from secondaries is the scope.
 - **Account recovery via a single device.** If the user only ever has one
   device and it dies, they must rely on the recovery phrase (see
-  [`encryption.md`](encryption.md)). This is intentional; the alternative is
+  [`pipeline-04-encryption.md`](pipeline-04-encryption.md)). This is intentional; the alternative is
   server-side escrow, which breaks the trust model.
 
 ## Industry variants considered

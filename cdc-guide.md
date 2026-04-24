@@ -11,7 +11,7 @@
 >
 > If you want the design-level summary ("we pick FastCDC, 256 KB / 1 MB /
 > 4 MB, per-user dedup, here's why for this specific system") see
-> [`umbrel-home/docs/chunking-dedup.md`](umbrel-home/docs/chunking-dedup.md).
+> [`umbrel-home/docs/pipeline-03-chunking.md`](umbrel-home/docs/pipeline-03-chunking.md).
 
 ## 1. The problem CDC solves
 

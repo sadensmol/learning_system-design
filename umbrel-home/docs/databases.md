@@ -83,6 +83,10 @@ streams are built on the oplog; both work, oplog tailing is simpler.)
 
 RPO is bounded by chunk cadence (seconds to minutes under normal load).
 
+How the tailer wakes on new oplog entries (tailable `awaitData` cursor)
+and how its position is persisted is covered in
+[`pipeline-01-detection.md` §MongoDB oplog tailer](pipeline-01-detection.md#mongodb-oplog-tailer).
+
 ### Periodic base snapshots
 
 Replaying the entire oplog from epoch-zero is intractable. A base
@@ -111,6 +115,10 @@ contain committed transactions not yet checkpointed into the main file.
 - The shipper also observes WAL checkpoints. When a checkpoint happens,
   the WAL is reset; the shipper rotates its own stream segment and keeps
   a local watermark of which frames it has durably shipped.
+
+How the shipper wakes on new WAL frames (inotify hint on `-wal` plus a
+polling safety net) and how its position is persisted is covered in
+[`pipeline-01-detection.md` §SQLite WAL shipper](pipeline-01-detection.md#sqlite-wal-shipper).
 
 Two subtle correctness points:
 
